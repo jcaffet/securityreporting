@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Spoke account resources for Security Reporting
+# Stack Name : securityreporting-spoke-account
+# Description : this stack creates the S3 bucket that will host all the spoke Security reports
+
+
+Parameters:
+
+  TagBlock:
+    Description: Applicative block tag
+    Type: String
+    Default: security
+
+  TagApp:
+    Description: Application referenced by this stack
+    Type: String
+    Default: securityreporting
+
+  TagOrg:
+    Description: Organization Unit
+    Type: String
+    Default: cloudteam
+
+  SecurityReportingBucketExpirationInDays:
+    Description: Objects retention in days. Set to 0 to disable expiration
+    Type: Number
+    Default: 30
+    MinValue: 0
+
+  SecurityReportingCentralAccount:
+    Description: AWS accountId in charge of AWS Organizations service
+    Type: String
+
+Conditions:
+
+  HasSecurityReportingBucketExpirationInDays: !Not [!Equals [!Ref SecurityReportingBucketExpirationInDays, 0]]
+
+
+Resources:
+
+  SecurityReportingSpokeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${TagApp}-spoke-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+        - AbortIncompleteMultipartUpload:
+            DaysAfterInitiation: 7
+          Status: Enabled
+        - ExpirationInDays: !Ref SecurityReportingBucketExpirationInDays
+          Status: !If [HasSecurityReportingBucketExpirationInDays, Enabled, Disabled]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: False
+        BlockPublicPolicy: False
+        IgnorePublicAcls: False
+        RestrictPublicBuckets: False
+      AccessControl : 'BucketOwnerFullControl'
+      Tags:
+      - Key: Block
+        Value: !Sub '${TagBlock}'
+      - Key: App
+        Value: !Sub '${TagApp}'
+      - Key: Org
+        Value: !Sub '${TagOrg}'
+
+  SecurityReportingSpokeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SecurityReportingSpokeBucket
+      PolicyDocument:
+        Statement:
+        - Action:
+          - s3:PutObject
+          Effect: "Allow"
+          Resource:
+          - !Sub "arn:aws:s3:::${SecurityReportingSpokeBucket}/*"
+          Principal:
+            AWS: !Sub "arn:aws:iam::${SecurityReportingCentralAccount}:root"
+          Condition:
+            StringEquals:
+              's3:x-amz-acl': 'bucket-owner-full-control'

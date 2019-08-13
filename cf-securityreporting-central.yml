@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Common resources for Security Reporting Bucket
+# Stack Name : securityreporting-central
+# Description : this stack creates the S3 bucket that will host all the centralized Security reports
+
+
+Parameters:
+
+  TagBlock:
+    Description: Applicative block tag
+    Type: String
+    Default: security
+
+  TagApp:
+    Description: Application referenced by this stack
+    Type: String
+    Default: securityreporting
+
+  TagOrg:
+    Description: Organization Unit
+    Type: String
+    Default: cloudteam
+
+  SecurityReportingBucketExpirationInDays:
+    Description: Objects retention in days. Set to 0 to disable expiration
+    Type: Number
+    Default: 365
+    MinValue: 0
+
+  SecurityReportingHarversterFrequency:
+    Description: define execution frequency of the account harverster
+    Type: String
+    Default: "cron(0 3 ? * * *)"
+
+  OrganizationRole:
+    Description: IAM role to assume on the Organizations account to SecurityReporting
+    Type: String
+    Default: securityreporting-organizations-role
+
+  OrganizationRoleExternalId:
+    Description: ExternalId of role on the Organizations account for SecurityReporting
+    Type: String
+
+  OrganizationAccount:
+    Description: AWS accountId using Organizations
+    Type: String
+
+  SecurityReportingSpokeStackSet:
+    Description: Name of the StackSet distributing spoke accounts
+    Type: String
+    Default: securityreporting-spoke-account
+
+Conditions:
+
+  HasSecurityReportingBucketExpirationInDays: !Not [!Equals [!Ref SecurityReportingBucketExpirationInDays, 0]]
+
+
+Resources:
+
+  SecurityReportingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${TagApp}-central-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+        - AbortIncompleteMultipartUpload:
+            DaysAfterInitiation: 7
+          Status: Enabled
+        - ExpirationInDays: !Ref SecurityReportingBucketExpirationInDays
+          Status: !If [HasSecurityReportingBucketExpirationInDays, Enabled, Disabled]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:*'
+          Function: !GetAtt SecurityReportingDispatcherLambda.Arn
+      Tags:
+      - Key: Block
+        Value: !Sub '${TagBlock}'
+      - Key: App
+        Value: !Sub '${TagApp}'
+      - Key: Org
+        Value: !Sub '${TagOrg}'
+
+  SecurityReportingBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref SecurityReportingDispatcherLambda
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:aws:s3:::${TagApp}-central-${AWS::AccountId}"
+
+  SecurityReportingDispatcherLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${TagApp}-dispatcher-lambda"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: "lambda.amazonaws.com"
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: write-cloudwatch-logs-allow
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:PutLogEvents
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            Resource:
+            - "arn:aws:logs:*:*:*"
+      - PolicyName: get-reporting-s3-allow
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            - s3:GetObject
+            Resource:
+            - !Sub "arn:aws:s3:::${TagApp}-central-${AWS::AccountId}"
+            - !Sub "arn:aws:s3:::${TagApp}-central-${AWS::AccountId}/*"
+      - PolicyName: put-reporting-s3-allow
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            - s3:PutObject
+            - s3:PutObjectAcl
+            Resource:
+            - !Sub "arn:aws:s3:::*"
+            - !Sub "arn:aws:s3:::*/*"
+
+  SecurityReportingDispatcherLambdaLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SecurityReportingDispatcherLambda}'
+      RetentionInDays: 30
+
+  SecurityReportingDispatcherLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Sub '${TagApp}-dispatcher'
+      Description: "Dispatch reports to all spoke accounts"
+      Handler: "index.lambda_handler"
+      Code:
+        ZipFile: |
+                  import os
+                  import json
+                  import logging
+                  import boto3
+                  from botocore.exceptions import ClientError
+                  def lambda_handler(event, context):
+                    DESTINATION_BUCKET_PREFIX = os.environ['DESTINATION_BUCKET_PREFIX']
+                    source_bucket = event['Records'][0]['s3']['bucket']['name']
+                    source_key= event['Records'][0]['s3']['object']['key']
+                    source_object = "%s/%s" % (source_bucket, source_key)
+                    source_key_split = source_key.split("/")
+                    source_object_without_prefix = source_key_split[-1]
+                    destination_bucket = "%s-%s" % (DESTINATION_BUCKET_PREFIX, source_key_split[0])
+                    print("Copy %s to %s/%s" % (source_object, destination_bucket, source_object_without_prefix))
+                    s3_client = boto3.client('s3')
+                    try:
+                      s3_client.copy_object(CopySource=source_object,
+                                            Bucket=destination_bucket,
+                                            Key=source_object_without_prefix,
+                                            ACL='bucket-owner-full-control',
+                                            ServerSideEncryption='AES256')
+                    except ClientError as e:
+                          logging.error(e)
+                          return False
+                    return True
+      Environment:
+        Variables:
+          DESTINATION_BUCKET_PREFIX: !Sub '${TagApp}-spoke'
+      MemorySize: 128
+      Role: !GetAtt SecurityReportingDispatcherLambdaRole.Arn
+      Runtime: "python3.7"
+      Timeout: 60
+      Tags:
+      - Key: Block
+        Value: !Ref TagBlock
+      - Key: Org
+        Value: !Ref TagOrg
+      - Key: App
+        Value: !Ref TagApp
+
+  SecurityReportingAccountHarversterScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: !Ref SecurityReportingHarversterFrequency
+      State: ENABLED
+      Targets:
+      - Id: "SecurityReportingAccountHarverster"
+        Arn: !GetAtt SecurityReportingAccountHarversterLambda.Arn
+
+  PermissionForRuleToInvokeLambdaAccountHarverster:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref SecurityReportingAccountHarversterLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt SecurityReportingAccountHarversterScheduledRule.Arn
+
+  SecurityReportingAccountHarversterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${TagApp}-account-harverster-lambda-invoke"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: "lambda.amazonaws.com"
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: assumeRoleOrganizationsPolicy
+        PolicyDocument:
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "sts:AssumeRole"
+            Resource:
+            - !Sub "arn:aws:iam::${OrganizationAccount}:role/${OrganizationRole}"
+      - PolicyName: write-cloudwatch-logs-allow
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:PutLogEvents
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            Resource:
+            - "arn:aws:logs:*:*:*"
+
+  SecurityReportingAccountHarversteLambdaLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SecurityReportingAccountHarversterLambda}'
+      RetentionInDays: 30
+
+  SecurityReportingAccountHarversterLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Sub '${TagApp}-account-harverster'
+      Description: "Launch Account Harverster"
+      Handler: "index.lambda_handler"
+      Code:
+        ZipFile: |
+                  import os
+                  import json
+                  import boto3
+                  def lambda_handler(event, context):
+                    ORGANIZATION_ROLE = os.environ['ORGANIZATION_ROLE']
+                    ORGANIZATION_ROLE_EXTERNALID = os.environ['ORGANIZATION_ROLE_EXTERNALID']
+                    ORGANIZATION_ACCOUNT = os.environ['ORGANIZATION_ACCOUNT']
+                    STACKSET_NAME = os.environ['STACKSET_NAME']
+                    STACKSET_REGION = os.environ['STACKSET_REGION']
+                    session = get_session(account=ORGANIZATION_ACCOUNT, role=ORGANIZATION_ROLE, externalId=ORGANIZATION_ROLE_EXTERNALID, session_name=ORGANIZATION_ROLE+"_lambda")
+                    activeAccountsList = getAllActiveAccounts(session)
+
+                    client = session.client('cloudformation')
+                    ListStackInstances =  client.list_stack_instances(StackSetName=STACKSET_NAME,StackInstanceRegion=STACKSET_REGION)
+                    existingAccountsList = list([stackInstance['Account'] for stackInstance in ListStackInstances['Summaries']])
+                    accountsToCreateList = list(set(activeAccountsList) - set(existingAccountsList))
+                    accountsToCreateList = []
+                    if accountsToCreateList:
+                      print("Found %s StackSet instances to create : %s" % (len(accountsToCreateList), accountsToCreateList))
+                      response = client.create_stack_instances(StackSetName=STACKSET_NAME,Accounts=accountsToCreateList,Regions=[STACKSET_REGION], OperationPreferences={'MaxConcurrentPercentage': 100})
+                    else:
+                      print("No stack instance to create.")
+
+
+                  def get_session(account=None, role=None, externalId=None, region=None, session_name='my_session'):
+                      # If the role is given : assumes a role and returns boto3 session
+                      # otherwise : returns a regular session with the current IAM user/role
+                      if role:
+                          client = boto3.client('sts')
+                          role_arn = 'arn:aws:iam::' + account + ':role/' + role
+                          response = client.assume_role(RoleArn=role_arn, ExternalId=externalId, RoleSessionName=session_name)
+                          session = boto3.Session(
+                              aws_access_key_id=response['Credentials']['AccessKeyId'],
+                              aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                              aws_session_token=response['Credentials']['SessionToken'],
+                              region_name=region)
+                          return session
+                      else:
+                          return boto3.Session()
+
+                  def getAllActiveAccounts(session):
+                      client = session.client('organizations')
+                      paginator = client.get_paginator('list_accounts')
+                      page_iterator = paginator.paginate()
+
+                      activeAccountIds = []
+                      for page in page_iterator:
+                        if "Accounts" in page:
+                          for account in page[ "Accounts" ]:
+                              if account['Status'] == "ACTIVE":
+                                activeAccountIds.append(account[ "Id" ])
+                      return activeAccountIds
+      Environment:
+        Variables:
+          ORGANIZATION_ROLE: !Ref OrganizationRole
+          ORGANIZATION_ROLE_EXTERNALID: !Ref OrganizationRoleExternalId
+          ORGANIZATION_ACCOUNT: !Ref OrganizationAccount
+          STACKSET_NAME: !Ref SecurityReportingSpokeStackSet
+          STACKSET_REGION: !Sub "${AWS::Region}"
+      MemorySize: 128
+      Role: !GetAtt SecurityReportingAccountHarversterLambdaRole.Arn
+      Runtime: "python3.7"
+      Timeout: 60
+      Tags:
+      - Key: Block
+        Value: !Ref TagBlock
+      - Key: Org
+        Value: !Ref TagOrg
+      - Key: App
+        Value: !Ref TagApp

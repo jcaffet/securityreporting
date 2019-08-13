@@ -1,0 +1,55 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack providing cross account access for SecurityReportsDispatcher
+# Stack Name : securityreporting-organizations-role
+
+Parameters:
+
+  SecurityReportingCentralAccount:
+    Description: SecurityReportsDispatcher AWS accountId
+    Type: String
+    ConstraintDescription: Must be a valid AWS account ID
+
+  SecurityReportingCentralRoleExternalId:
+    Description: SecurityReportsDispatcher Role ExternalID
+    Type: String
+
+  SecurityReportingStackSetSpokeName:
+    Description: Name of the StackSet in charge of distributing spoke account assets
+    Type: String
+    Default: securityreporting-spoke-account
+
+Resources:
+
+  SecurityReportingOrgRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: securityreporting-organizations-role
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${SecurityReportingCentralAccount}:root'
+          Action:
+          - sts:AssumeRole
+          Condition:
+            StringEquals:
+              "sts:ExternalId": !Sub '${SecurityReportingCentralRoleExternalId}'
+      Policies:
+      - PolicyName: "AllowOrganizationListAccounts"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action: organizations:ListAccounts
+            Resource: '*'
+      - PolicyName: "AllowUpdateStackInstances"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - cloudformation:CreateStackInstances
+            - cloudformation:ListStackInstances
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stackset/${SecurityReportingStackSetSpokeName}:*"
